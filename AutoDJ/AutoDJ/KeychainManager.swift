@@ -2,11 +2,13 @@ import Foundation
 import Security
 
 enum KeychainManager {
+    private static let service = "com.autodj.app"
+
     static func save(_ value: String, forKey key: String) {
         guard let data = value.data(using: .utf8) else { return }
         let query: [CFString: Any] = [
             kSecClass: kSecClassGenericPassword,
-            kSecAttrService: "com.autodj.app",
+            kSecAttrService: service,
             kSecAttrAccount: key,
             kSecValueData: data,
             kSecAttrAccessible: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
@@ -14,14 +16,14 @@ enum KeychainManager {
         SecItemDelete(query as CFDictionary)
         let status = SecItemAdd(query as CFDictionary, nil)
         if status != errSecSuccess {
-            print("Keychain save failed for \(key): \(status)")
+            print("[Keychain] Save failed for '\(key)': OSStatus \(status)")
         }
     }
 
     static func load(forKey key: String) -> String? {
         let query: [CFString: Any] = [
             kSecClass: kSecClassGenericPassword,
-            kSecAttrService: "com.autodj.app",
+            kSecAttrService: service,
             kSecAttrAccount: key,
             kSecReturnData: true,
             kSecMatchLimit: kSecMatchLimitOne
@@ -30,14 +32,15 @@ enum KeychainManager {
         let status = SecItemCopyMatching(query as CFDictionary, &result)
         guard status == errSecSuccess,
               let data = result as? Data,
-              let string = String(data: data, encoding: .utf8) else { return nil }
+              let string = String(data: data, encoding: .utf8)
+        else { return nil }
         return string
     }
 
     static func delete(forKey key: String) {
         let query: [CFString: Any] = [
             kSecClass: kSecClassGenericPassword,
-            kSecAttrService: "com.autodj.app",
+            kSecAttrService: service,
             kSecAttrAccount: key
         ]
         SecItemDelete(query as CFDictionary)

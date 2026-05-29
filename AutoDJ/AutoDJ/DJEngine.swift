@@ -1,57 +1,54 @@
 import Foundation
-import AVFoundation
 import Combine
 
-/// DJEngine monitors Spotify playback and triggers crossfade when a track
-/// is within `crossfadeDuration` seconds of its end.
-///
-/// Because Spotify Web API doesn't expose audio streams, we use the
-/// Spotify volume endpoint to fade out the current track and fade in
-/// the next track simultaneously, creating the DJ crossfade effect.
+/// DJEngine is the central orchestrator.
+/// It watches Spotify playback, scores each upcoming transition,
+/// and fires the TransitionEngine at the right beat-aligned moment.
 @MainActor
 class DJEngine: ObservableObject {
     static let shared = DJEngine()
 
-    // MARK: - Settings
+    // MARK: - Published State
 
     @Published var isDJModeEnabled: Bool = false {
         didSet { isDJModeEnabled ? startEngine() : stopEngine() }
     }
-    @Published var crossfadeDuration: Double = 8.0   // seconds
-
-    // MARK: - State
-
-    @Published var isFading = false
+    @Published var compatibilityScore: CompatibilityScore?
+    @Published var sessionEnergyArc: [SessionEnergyPoint] = []
     @Published var currentVolume: Int = 100
 
-    private var lastTrackID: String?
-    private var fadeTask: Task<Void, Never>?
-    private var monitorTask: Task<Void, Never>?
-    private var fadingTrackID: String?
+    // MARK: - Settings (delegated to AppSettings)
+    private let settings = AppSettings.shared
 
-    private let apiManager = SpotifyAPIManager.shared
+    // MARK: - Internal State
+
+    private var monitorTask: Task<Void, Never>?
+    private var lastTrackID = ""
+    private var activeTransitionTrackID = ""
+    private var transitionFired = false
+
+    private let api          = SpotifyAPIManager.shared
+    private let transitions  = TransitionEngine.shared
 
     private init() {}
 
-    // MARK: - Engine Lifecycle
+    // MARK: - Lifecycle
 
     func startEngine() {
+        transitions.setupAudioEngine()
         monitorTask?.cancel()
         monitorTask = Task { [weak self] in
             while !Task.isCancelled {
-                await self?.checkAndFade()
-                try? await Task.sleep(nanoseconds: 500_000_000) // 0.5s tick
+                await self?.tick()
+                try? await Task.sleep(nanoseconds: 500_000_000)
             }
         }
     }
 
     func stopEngine() {
         monitorTask?.cancel()
-        fadeTask?.cancel()
         monitorTask = nil
-        fadeTask = nil
-        isFading = false
-        fadingTrackID = nil
+        transitions.stop()
     }
 
     func stop() {
@@ -59,85 +56,89 @@ class DJEngine: ObservableObject {
         stopEngine()
     }
 
-    // MARK: - Core Logic
+    // MARK: - Main Tick
 
-    private func checkAndFade() async {
-        guard isDJModeEnabled,
-              let state = apiManager.playbackState,
-              state.isPlaying else { return }
-
+    private func tick() async {
+        guard let state = api.playbackState, state.isPlaying else { return }
         let track = state.track
 
-        // New track detected — reset fade state
+        // New track detected
         if track.id != lastTrackID {
             lastTrackID = track.id
-            fadingTrackID = nil
-            isFading = false
-            fadeTask?.cancel()
-            fadeTask = nil
-            // Restore full volume on track change
-            await restoreVolume()
-        }
-
-        // Already fading this track
-        if fadingTrackID == track.id { return }
-
-        // Check if we're within the crossfade window
-        let remainingSec = Double(state.remainingMs) / 1000.0
-        if remainingSec <= crossfadeDuration && remainingSec > 0 {
-            fadingTrackID = track.id
-            await performCrossfade(duration: min(remainingSec, crossfadeDuration))
-        }
-    }
-
-    // MARK: - Crossfade
-
-    private func performCrossfade(duration: Double) async {
-        isFading = true
-        defer { isFading = false }
-
-        let steps = max(Int(duration * 10), 1) // 10 steps per second
-        let stepDelay = UInt64((duration / Double(steps)) * 1_000_000_000)
-
-        // Fade out current track volume 100 → 0
-        for step in 0...steps {
-            if Task.isCancelled { break }
-            let volume = Int(Double(100) * (1.0 - Double(step) / Double(steps)))
-            currentVolume = volume
-            await apiManager.setVolume(volume)
-            if step < steps {
-                try? await Task.sleep(nanoseconds: stepDelay)
-            }
-        }
-
-        // Skip to next track
-        if !Task.isCancelled {
-            await apiManager.skipToNext()
-            // Brief pause to let Spotify register the skip
-            try? await Task.sleep(nanoseconds: 300_000_000)
-        }
-
-        // Fade in new track 0 → 100
-        if !Task.isCancelled {
-            for step in 0...steps {
-                if Task.isCancelled { break }
-                let volume = Int(Double(100) * Double(step) / Double(steps))
-                currentVolume = volume
-                await apiManager.setVolume(volume)
-                if step < steps {
-                    try? await Task.sleep(nanoseconds: stepDelay)
-                }
-            }
-        }
-
-        if !Task.isCancelled {
+            transitionFired = false
+            activeTransitionTrackID = ""
             currentVolume = 100
-            await apiManager.setVolume(100)
+
+            // Record energy arc point
+            if let features = state.audioFeatures {
+                let point = SessionEnergyPoint(
+                    timestamp: Date(),
+                    trackID: track.id,
+                    energy: features.energy
+                )
+                sessionEnergyArc.append(point)
+                if sessionEnergyArc.count > 50 { sessionEnergyArc.removeFirst() }
+            }
+
+            // Re-score with new next track
+            updateCompatibilityScore()
+        }
+
+        guard isDJModeEnabled,
+              !transitionFired,
+              activeTransitionTrackID != track.id
+        else { return }
+
+        guard let currentFeatures = state.audioFeatures,
+              let nextFeatures = api.nextTrackFeatures
+        else { return }
+
+        // Calculate beat-aligned transition window
+        let beats = settings.transitionLength.beats
+        let energyN = CompatibilityEngine.energyNote(
+            currentEnergy: currentFeatures.energy,
+            nextEnergy: nextFeatures.energy
+        )
+        let windowSec = CompatibilityEngine.transitionWindowSeconds(
+            bpm: currentFeatures.tempo,
+            beats: beats,
+            energyNote: energyN
+        )
+
+        // Fire when within the transition window
+        if state.remainingSec <= windowSec && state.remainingSec > 0.5 {
+            transitionFired = true
+            activeTransitionTrackID = track.id
+
+            guard let score = compatibilityScore else { return }
+
+            await transitions.executeTransition(
+                score: score,
+                currentFeatures: currentFeatures,
+                nextFeatures: nextFeatures,
+                style: settings.transitionStyle,
+                length: settings.transitionLength
+            )
         }
     }
 
-    private func restoreVolume() async {
-        currentVolume = 100
-        await apiManager.setVolume(100)
+    // MARK: - Compatibility Score Update
+
+    func updateCompatibilityScore() {
+        guard let currentFeatures = api.playbackState?.audioFeatures,
+              let nextFeatures = api.nextTrackFeatures
+        else {
+            compatibilityScore = nil
+            return
+        }
+        compatibilityScore = CompatibilityEngine.score(
+            current: currentFeatures,
+            next: nextFeatures
+        )
     }
+
+    // MARK: - Convenience
+
+    var isTransitioning: Bool { transitions.isTransitioning }
+    var transitionProgress: Double { transitions.transitionProgress }
 }
